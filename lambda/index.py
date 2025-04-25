@@ -1,112 +1,91 @@
 # lambda/index.py
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
+import re                       # --- そのまま残す
+import urllib.request           # ★ 追加：FastAPI を呼び出すため
+import urllib.error             # ★ 追加：エラーハンドリング用
+# boto3 や Bedrock 関連の import は不要になったので削除
+# import boto3
+# from botocore.exceptions import ClientError
 
 
-# Lambda コンテキストからリージョンを抽出する関数
+# Lambda コンテキストからリージョンを抽出する関数（残しても支障なし）
 def extract_region_from_arn(arn):
     # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
+    match = re.search(r'arn:aws:lambda:([^:]+):', arn)
     if match:
         return match.group(1)
     return "us-east-1"  # デフォルト値
 
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
 
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# --- Bedrock 関連のグローバル変数を削除 -----------------------------
+# bedrock_client = None
+# MODEL_ID       = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+
+# ★ 追加：FastAPI のエンドポイントを環境変数から取得
+
+FASTAPI_URL = "https://410d-2400-2411-9961-7200-899d-3479-5de9-608d.ngrok-free.app/startup"
+
 
 def lambda_handler(event, context):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
+        # ------------------------------------------------------------
+        # 受信イベントの確認
+        # ------------------------------------------------------------
         print("Received event:", json.dumps(event))
-        
-        # Cognitoで認証されたユーザー情報を取得
+
+        # Cognitoで認証されたユーザー情報を取得（元コードを維持）
         user_info = None
         if 'requestContext' in event and 'authorizer' in event['requestContext']:
             user_info = event['requestContext']['authorizer']['claims']
             print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
+
+        # ------------------------------------------------------------
         # リクエストボディの解析
+        # ------------------------------------------------------------
         body = json.loads(event['body'])
         message = body['message']
         conversation_history = body.get('conversationHistory', [])
-        
+
         print("Processing message:", message)
-        print("Using model:", MODEL_ID)
-        
-        # 会話履歴を使用
-        messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
+
+        # ------------------------------------------------------------
+        # FastAPI へ送信するペイロードを準備
+        # ------------------------------------------------------------
+        fastapi_payload = {
+            "message": message,
+            "conversationHistory": conversation_history
         }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+        json_payload = json.dumps(fastapi_payload).encode("utf-8")
+
+        # ------------------------------------------------------------
+        # FastAPI エンドポイント呼び出し
+        # ------------------------------------------------------------
+        print(f"Calling FastAPI at {FASTAPI_URL} with payload:", json_payload.decode())
+        req = urllib.request.Request(
+            url=FASTAPI_URL,
+            data=json_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
         )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
+
+        with urllib.request.urlopen(req, timeout=30) as res:
+            response_body = json.loads(res.read().decode("utf-8"))
+
+        print("FastAPI response:", json.dumps(response_body, default=str))
+
+        # ------------------------------------------------------------
+        # FastAPI 応答の検証
+        # ------------------------------------------------------------
+        if not response_body.get("success"):
+            raise Exception(f"FastAPI error: {response_body.get('error', 'Unknown error')}")
+
+        assistant_response   = response_body.get("response", "")
+        updated_conversation = response_body.get("conversationHistory", [])
+
+        # ------------------------------------------------------------
         # 成功レスポンスの返却
+        # ------------------------------------------------------------
         return {
             "statusCode": 200,
             "headers": {
@@ -118,13 +97,49 @@ def lambda_handler(event, context):
             "body": json.dumps({
                 "success": True,
                 "response": assistant_response,
-                "conversationHistory": messages
+                "conversationHistory": updated_conversation
             })
         }
-        
+
+    # ------------------------------------------------------------
+    # エラーハンドリング
+    # ------------------------------------------------------------
+    except urllib.error.HTTPError as e:
+        error_msg = f"HTTPError {e.code}: {e.reason}"
+        print("Error:", error_msg)
+        return {
+            "statusCode": 502,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": error_msg
+            })
+        }
+
+    except urllib.error.URLError as e:
+        error_msg = f"URLError: {e.reason}"
+        print("Error:", error_msg)
+        return {
+            "statusCode": 504,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": error_msg
+            })
+        }
+
     except Exception as error:
         print("Error:", str(error))
-        
         return {
             "statusCode": 500,
             "headers": {
